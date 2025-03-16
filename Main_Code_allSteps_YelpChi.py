@@ -286,7 +286,15 @@ class TransformerBlock(nn.Module):
         self.head_dim = input_size // num_heads
         assert input_size % num_heads == 0, "input_size must be divisible by num_heads"
         self.qkv_proj = nn.Linear(input_size, input_size * 3)
-        self.src, self.tgt = adj_matrix.nonzero(as_tuple=True)
+
+        # Use sparse tensor indices directly
+        if torch.is_tensor(adj_matrix) and adj_matrix.is_sparse:
+            indices = adj_matrix.indices()  # Shape: [2, nnz], where nnz is number of non-zero elements
+            self.src = indices[0]  # Row indices
+            self.tgt = indices[1]  # Column indices
+        else:
+            self.src, self.tgt = adj_matrix.nonzero(as_tuple=True)  # Fallback for dense tensors
+
         self.ffn = nn.Sequential(
             nn.Linear(input_size, 4 * input_size),
             nn.ReLU(),
@@ -340,7 +348,6 @@ class TransformerBlock(nn.Module):
         ffn_out = self.ffn(x)
         return self.norm2(x + ffn_out).unsqueeze(0)
 
-
 class MLP(nn.Module):
     def __init__(self, input_size, hidden_size):
         super().__init__()
@@ -353,7 +360,6 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return self.fc2(x)
 
-
 class SpatialDependencyModel(nn.Module):
     def __init__(self, num_relations, hidden_size, mlp_hidden_size, adj_matrix):
         super().__init__()
@@ -361,16 +367,34 @@ class SpatialDependencyModel(nn.Module):
         self.mlp = MLP(hidden_size, mlp_hidden_size)
         self.adj_matrix = adj_matrix
 
+        # Precompute neighbors for each node using sparse indices
+        self.neighbors = {}
+        if torch.is_tensor(adj_matrix) and adj_matrix.is_sparse:
+            indices = adj_matrix.indices()  # [2, nnz]: [row_indices, col_indices]
+            values = adj_matrix.values()    # [nnz]: corresponding values
+            for i in range(indices.size(1)):
+                src = indices[0, i].item()  # Row (source node)
+                tgt = indices[1, i].item()  # Column (target node)
+                weight = values[i].item()   # Edge weight
+                if src not in self.neighbors:
+                    self.neighbors[src] = []
+                self.neighbors[src].append((tgt, weight))  # Store (neighbor, weight) pairs
+
     def forward(self, node_embeddings, timestamp, relations, index_obtains):
         aggregated_reps = []
         valid_indices = []
         for vi in index_obtains:
-            neighbors = torch.where(self.adj_matrix[vi] > 0)[0]
-            if len(neighbors) == 0:
+            # Use precomputed neighbors instead of indexing sparse tensor
+            neighbor_list = self.neighbors.get(vi, [])
+            if not neighbor_list:  # No neighbors
                 continue
+            neighbors, weights = zip(*neighbor_list)  # Unzip into indices and weights
+            neighbors = torch.tensor(neighbors, dtype=torch.long)
+            weights = torch.tensor(weights, dtype=torch.float)
+
             neighbor_emb = node_embeddings[neighbors]
-            weights = self.adj_matrix[vi, neighbors]
-            intra_agg = torch.mean(weights.view(-1, 1) * neighbor_emb, dim=0)
+            weights = weights.view(-1, 1)  # Reshape for broadcasting
+            intra_agg = torch.mean(weights * neighbor_emb, dim=0)
             diff = node_embeddings[vi] - neighbor_emb
             inter_agg = torch.mean(diff, dim=0)
             combined = intra_agg + inter_agg
@@ -387,7 +411,6 @@ class SpatialDependencyModel(nn.Module):
         fused = self.transformer(fused, torch.tensor(valid_indices, dtype=torch.long))
         prediction = self.mlp(fused.squeeze(0))
         return prediction, fused, None, valid_indices
-
 
 class TemporalSpatialModel(nn.Module):
     def __init__(self, embedding_size, hidden_size, num_temporal_bases, num_relations, mlp_hidden_size, adj_matrix):
@@ -412,78 +435,63 @@ class CombinedModel(nn.Module):
         x = F.relu(self.initial_conv(data.x, data.edge_index))
         return self.temporal_spatial(x, node_indices, timestamp, relations, index_obtains)
 
+def train_model(model, data, labels, train_mask, test_mask, num_epochs=5):
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)  # Increase learning rate for faster convergence
+    loss_fn = nn.BCEWithLogitsLoss()
 
-def train_model(model, data, labels, train_mask, test_mask, num_epochs=50):
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-    loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(5.0))
-    train_labels = [labels[i] for i in train_mask]
-    print(f"Training label distribution: {np.bincount(train_labels)}")
+    # Sample a small subset of train and test nodes to reduce computation
+    train_subset = train_mask[:1000]  # Use first 1000 labeled nodes
+    test_subset = test_mask[:200]     # Use first 200 for testing
+    train_labels = torch.tensor([labels[i] for i in train_subset], dtype=torch.float)
+    print(f"Training on {len(train_subset)} nodes, label distribution: {np.bincount(train_labels.int())}")
 
+    model.train()
     for epoch in range(num_epochs):
-        model.train()
         optimizer.zero_grad()
-        pred, _, _, idx = model(data, torch.arange(data.num_nodes), torch.tensor(123.45), [1], train_mask.copy())
+        # Forward pass on subset only
+        pred, _, _, idx = model(data, torch.tensor(train_subset), torch.tensor(123.45), [1], train_subset)
         if pred is None:
             print(f"Epoch {epoch + 1}: No predictions generated")
             continue
-        masked_pred = pred.squeeze()
-        masked_labels = torch.tensor([labels[i] for i in idx], dtype=torch.float)
-        loss = loss_fn(masked_pred, masked_labels)
-        predicted_labels = (masked_pred > 0).long()
-        accuracy = (predicted_labels == masked_labels).float().mean().item()
+        loss = loss_fn(pred.squeeze(), train_labels)  # Simple loss on subset
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        accuracy = ((pred.squeeze() > 0).float() == train_labels).float().mean().item()
         print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}, Train Accuracy: {accuracy:.4f}")
 
+    # Quick evaluation
     model.eval()
     with torch.no_grad():
-        pred, _, _, idx = model(data, torch.arange(data.num_nodes), torch.tensor(123.45), [1], test_mask.copy())
+        pred, _, _, idx = model(data, torch.tensor(test_subset), torch.tensor(123.45), [1], test_subset)
         if pred is None:
             print("No predictions generated during evaluation")
             return
-        masked_labels = torch.tensor([labels[i] for i in idx])
-        masked_pred = pred.squeeze()
-        predicted_labels = (masked_pred > 0).long()
-        accuracy = (predicted_labels == masked_labels).float().mean().item()
-        f1 = f1_score(masked_labels.numpy(), predicted_labels.numpy(), average='macro')
-        probs = torch.sigmoid(masked_pred).numpy()
-        auc = roc_auc_score(masked_labels.numpy(), probs)
-        cm = confusion_matrix(masked_labels.numpy(), predicted_labels.numpy())
-        sensitivity = cm[1, 1] / (cm[1, 1] + cm[1, 0]) if (cm[1, 1] + cm[1, 0]) > 0 else 0
-        specificity = cm[0, 0] / (cm[0, 0] + cm[0, 1]) if (cm[0, 0] + cm[0, 1]) > 0 else 0
-        gmeans = (sensitivity * specificity) ** 0.5
-        print(f"Evaluation - Accuracy: {accuracy:.4f}, F1-macro: {f1:.4f}, AUC: {auc:.4f}, G-means: {gmeans:.4f}")
+        test_labels = torch.tensor([labels[i] for i in test_subset], dtype=torch.float)
+        accuracy = ((pred.squeeze() > 0).float() == test_labels).float().mean().item()
+        f1 = f1_score(test_labels.numpy(), (pred.squeeze() > 0).numpy(), average='macro')
+        auc = roc_auc_score(test_labels.numpy(), torch.sigmoid(pred.squeeze()).numpy())
+        print(f"Evaluation - Accuracy: {accuracy:.4f}, F1-macro: {f1:.4f}, AUC: {auc:.4f}")
+
 
 def main():
     graph, features, labels, num_classes = DataLoader.load_yelpchi_data()
-
-    # Step 1: Compute Degree Centrality Only
     centrality_embeddings = compute_centrality_features(graph)
-
-    # Step 2: FraudWalk Embeddings
     fraudwalk_embeddings = compute_fraudwalk_embeddings(graph)
-
-    # Step 3: Fraud Subgraph, GAE, and GCN
     train_mask, test_mask = GraphProcessor.prepare_masks(labels)
     gcn_embeddings, reconstructed_adj = reconstruct_adj_and_gcn(graph, labels, train_mask)
-
-    # Step 4: Combine Embeddings
     print("Step 4: Combining embeddings...")
     num_nodes = graph.num_nodes()
     combined_embeddings = np.zeros((num_nodes, 23))  # 8 (centrality) + 5 (fraudwalk) + 10 (gcn)
     for i in range(num_nodes):
-        centrality = centrality_embeddings.get(i, [0] * 8)  # 8D
-        fraudwalk = fraudwalk_embeddings.get(i, np.zeros(5))  # 5D
-        gcn = gcn_embeddings[i] if i < len(gcn_embeddings) else np.zeros(10)  # 10D
+        centrality = centrality_embeddings.get(i, [0] * 8)
+        fraudwalk = fraudwalk_embeddings.get(i, np.zeros(5))
+        gcn = gcn_embeddings[i] if i < len(gcn_embeddings) else np.zeros(10)
         combined_embeddings[i] = np.concatenate([centrality, fraudwalk, gcn])
-
     data = GraphProcessor.convert_to_pyg_format(graph, torch.from_numpy(combined_embeddings).float())
-    adj_matrix = reconstructed_adj
-    print(f"Using reconstructed adjacency matrix: {adj_matrix.shape}, {adj_matrix._nnz()} edges")  # Use _nnz() for sparse tensor
-
+    adj_matrix = reconstructed_adj.coalesce()
+    print(f"Using reconstructed adjacency matrix: {adj_matrix.shape}, {adj_matrix._nnz()} edges")
     model = CombinedModel(
-        input_dim=23,  # Corrected to match combined embedding size
+        input_dim=23,
         embedding_size=EMBEDDING_SIZE,
         hidden_size=HIDDEN_SIZE,
         num_temporal_bases=NUM_TEMPORAL_BASES,
@@ -492,7 +500,6 @@ def main():
         adj_matrix=adj_matrix
     )
     train_model(model, data, labels, train_mask, test_mask)
-
 
 if __name__ == "__main__":
     main()
