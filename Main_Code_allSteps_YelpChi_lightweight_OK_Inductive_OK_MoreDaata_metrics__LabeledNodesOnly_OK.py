@@ -8,7 +8,8 @@ from torch_geometric.nn import GCNConv
 from torch_geometric.data import Data
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix
+from sklearn.metrics import (f1_score, roc_auc_score, confusion_matrix,
+                             precision_score, recall_score, classification_report)
 import random
 import networkx as nx
 import pandas as pd
@@ -47,9 +48,8 @@ def compute_fraudwalk_embeddings(graph, train_mask=None, inductive_nodes=None):
     G = nx.DiGraph()
     G.add_edges_from(edge_list)
 
-    # Simple random walk function
     def simple_random_walk(start_node, walk_length=5):
-        walk = [str(start_node)]  # Convert to string for Word2Vec compatibility
+        walk = [str(start_node)]
         current = start_node
         for _ in range(walk_length - 1):
             neighbors = list(G.neighbors(current))
@@ -59,24 +59,22 @@ def compute_fraudwalk_embeddings(graph, train_mask=None, inductive_nodes=None):
             walk.append(str(current))
         return walk
 
-    # Train DeepWalk model on training nodes
     num_walks = 50
     nodes = list(G.nodes())
     if train_mask is not None:
         train_nodes = [n for n in nodes if n in train_mask]
     else:
-        train_nodes = nodes  # Use all nodes if no mask provided
+        train_nodes = nodes
     walks = [simple_random_walk(random.choice(train_nodes)) for _ in range(num_walks)]
     model = Word2Vec(sentences=walks, vector_size=5, window=3, sg=1, min_count=1, workers=4)
     base_embeddings = {int(node): model.wv[node] for node in model.wv.index_to_key if str(node).isdigit()}
     print(f"Base FraudWalk embeddings trained for {len(base_embeddings)} nodes.")
 
-    # Inductive Pooling for new/unseen nodes
     fraudwalk_embeddings = base_embeddings.copy()
     if inductive_nodes is not None:
         for node in inductive_nodes:
             if node not in G:
-                fraudwalk_embeddings[node] = np.zeros(5)  # Zero init for isolated nodes
+                fraudwalk_embeddings[node] = np.zeros(5)
                 continue
             neighbors = list(G.neighbors(node))
             if not neighbors:
@@ -84,9 +82,9 @@ def compute_fraudwalk_embeddings(graph, train_mask=None, inductive_nodes=None):
             else:
                 neighbor_embs = [base_embeddings.get(n, np.zeros(5)) for n in neighbors if n in base_embeddings]
                 if neighbor_embs:
-                    fraudwalk_embeddings[node] = np.mean(neighbor_embs, axis=0)  # Mean pooling
+                    fraudwalk_embeddings[node] = np.mean(neighbor_embs, axis=0)
                 else:
-                    fraudwalk_embeddings[node] = np.zeros(5)  # Fallback if no neighbors have embeddings
+                    fraudwalk_embeddings[node] = np.zeros(5)
         print(f"Inductive embeddings computed for {len(inductive_nodes)} nodes.")
 
     print(f"Total FraudWalk embeddings generated for {len(fraudwalk_embeddings)} nodes.")
@@ -201,7 +199,7 @@ class DataLoader:
         return graph, features, labels, num_classes
 
 
-# GraphProcessor
+# GraphProcessor with Increased Data Usage
 class GraphProcessor:
     @staticmethod
     def convert_to_pyg_format(graph, features):
@@ -217,18 +215,24 @@ class GraphProcessor:
 
     @staticmethod
     def prepare_masks(labels, train_ratio=0.8):
-        print("Preparing train/test masks...")
+        print("Preparing train/test masks with increased data usage...")
         labeled_idx = torch.where(labels != -1)[0].tolist()
-        pos_idx = [i for i in labeled_idx if labels[i] == 1]
-        neg_idx = [i for i in labeled_idx if labels[i] == 0]
-        test_pos = pos_idx[:10] if len(pos_idx) >= 10 else pos_idx
-        test_neg = neg_idx[:190] if len(neg_idx) >= 190 else neg_idx[:int(200 - len(test_pos))]
-        test_idx = test_pos + test_neg
-        train_idx = [i for i in labeled_idx if i not in test_idx][:1000]
-        random.shuffle(train_idx)
-        random.shuffle(test_idx)
-        train_mask, test_mask = train_idx, test_idx
-        print(f"Train mask: {len(train_mask)} nodes, Test mask: {len(test_mask)} nodes")
+        pos_idx = [i for i in labeled_idx if labels[i] == 1]  # Fraud
+        neg_idx = [i for i in labeled_idx if labels[i] == 0]  # Non-fraud
+
+        # Use all available labeled data, split by train_ratio
+        train_pos, test_pos = train_test_split(pos_idx, train_size=train_ratio, random_state=42)
+        train_neg, test_neg = train_test_split(neg_idx, train_size=train_ratio, random_state=42)
+
+        train_mask = train_pos + train_neg
+        test_mask = test_pos + test_neg
+        random.shuffle(train_mask)
+        random.shuffle(test_mask)
+
+        train_labels = [labels[i] for i in train_mask]
+        test_labels = [labels[i] for i in test_mask]
+        print(f"Train mask: {len(train_mask)} nodes, Label distribution: {np.bincount(train_labels)}")
+        print(f"Test mask: {len(test_mask)} nodes, Label distribution: {np.bincount(test_labels)}")
         return train_mask, test_mask
 
 
@@ -356,6 +360,8 @@ class SpatialDependencyModel(nn.Module):
         for vi in index_obtains:
             neighbor_list = self.neighbors.get(vi, [])
             if not neighbor_list:
+                aggregated_reps.append(node_embeddings[vi])
+                valid_indices.append(vi)
                 continue
             neighbors, weights = zip(*neighbor_list)
             neighbors = torch.tensor(neighbors, dtype=torch.long)
@@ -369,13 +375,12 @@ class SpatialDependencyModel(nn.Module):
             if combined.dim() > 0:
                 aggregated_reps.append(combined)
                 valid_indices.append(vi)
-        if not aggregated_reps:
-            fused = node_embeddings[torch.tensor(index_obtains)].unsqueeze(0)
-            prediction = self.mlp(fused.squeeze(0))
-            return prediction, fused, None, index_obtains
-        fused = torch.stack(aggregated_reps).unsqueeze(0)
+
+        fused = torch.stack(aggregated_reps)
+        fused = fused.unsqueeze(0)
         fused = self.transformer(fused, torch.tensor(valid_indices, dtype=torch.long))
-        prediction = self.mlp(fused.squeeze(0))
+        fused = fused.squeeze(0)
+        prediction = self.mlp(fused)
         return prediction, fused, None, valid_indices
 
 
@@ -403,12 +408,11 @@ class CombinedModel(nn.Module):
         return self.temporal_spatial(x, node_indices, timestamp, relations, index_obtains)
 
 
-# Lightweight Training
+# Updated Training Function with Additional Metrics
 def train_model(model, data, labels, train_mask, test_mask, num_epochs=5):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     loss_fn = nn.BCEWithLogitsLoss()
-    train_subset = train_mask[:1000]
-    # train_subset = train_mask[:10000]
+    train_subset = train_mask  # Use all available training data
     test_subset = test_mask
     train_labels = torch.tensor([labels[i] for i in train_subset], dtype=torch.float)
     print(f"Training on {len(train_subset)} nodes, label distribution: {np.bincount(train_labels.int())}")
@@ -433,15 +437,34 @@ def train_model(model, data, labels, train_mask, test_mask, num_epochs=5):
             print("No predictions generated during evaluation")
             return
         test_labels = torch.tensor([labels[i] for i in test_subset], dtype=torch.float)
-        accuracy = ((pred.squeeze() > 0).float() == test_labels).float().mean().item()
-        f1 = f1_score(test_labels.numpy(), (pred.squeeze() > 0).numpy(), average='macro')
-        unique_classes = np.unique(test_labels.numpy())
-        if len(unique_classes) > 1:
-            auc = roc_auc_score(test_labels.numpy(), torch.sigmoid(pred.squeeze()).numpy())
-            print(f"Evaluation - Accuracy: {accuracy:.4f}, F1-macro: {f1:.4f}, AUC: {auc:.4f}")
-        else:
-            print(
-                f"Evaluation - Accuracy: {accuracy:.4f}, F1-macro: {f1:.4f}, AUC: Not defined (only one class present)")
+        pred_binary = (pred.squeeze() > 0).float()  # Convert logits to binary predictions
+        test_labels_np = test_labels.numpy()
+        pred_binary_np = pred_binary.numpy()
+
+        # Calculate metrics
+        accuracy = (pred_binary == test_labels).float().mean().item()
+        precision = precision_score(test_labels_np, pred_binary_np)
+        recall = recall_score(test_labels_np, pred_binary_np)
+        f1_micro = f1_score(test_labels_np, pred_binary_np, average='micro')
+        f1_macro = f1_score(test_labels_np, pred_binary_np, average='macro')
+        unique_classes = np.unique(test_labels_np)
+        auc = roc_auc_score(test_labels_np, torch.sigmoid(pred.squeeze()).numpy()) if len(unique_classes) > 1 else None
+
+        # Confusion Matrix
+        cm = confusion_matrix(test_labels_np, pred_binary_np)
+
+        # Print detailed evaluation
+        print("\nEvaluation Metrics:")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1-Score (Micro): {f1_micro:.4f}")
+        print(f"F1-Score (Macro): {f1_macro:.4f}")
+        print(f"AUC: {auc:.4f}" if auc is not None else "AUC: Not defined (only one class present)")
+        print("\nConfusion Matrix:")
+        print(cm)
+        print("\nClassification Report:")
+        print(classification_report(test_labels_np, pred_binary_np, target_names=['Non-Fraud', 'Fraud']))
 
 
 # Main Function
@@ -450,9 +473,7 @@ def main():
     centrality_embeddings = compute_centrality_features(graph)
     train_mask, test_mask = GraphProcessor.prepare_masks(labels)
 
-    # Compute FraudWalk embeddings with inductive pooling
     fraudwalk_embeddings = compute_fraudwalk_embeddings(graph, train_mask=train_mask, inductive_nodes=test_mask)
-
     gcn_embeddings, reconstructed_adj = reconstruct_adj_and_gcn(graph, labels, train_mask)
     print("Step 4: Combining embeddings...")
     num_nodes = graph.num_nodes()
