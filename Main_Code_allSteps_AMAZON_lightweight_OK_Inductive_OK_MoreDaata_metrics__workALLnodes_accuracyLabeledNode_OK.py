@@ -494,3 +494,41 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# =============Expected Output (Grok)================
+#For FraudAmazonDataset (~11,944 nodes, ~4.4M edges across all relations, but fewer for one edge type):
+# Loading Amazon-Fraud dataset from DGL...
+# Dataset loaded: 11944 nodes, 4398392 edges, 25 features, 2 classes
+# Step 1: Computing degree centrality (only)...
+# Degree centrality computed for 11944 nodes.
+# Preparing train/test masks using all data...
+# Total nodes: 11944, Train mask: 9555 nodes, Test mask: 2389 nodes
+# Labeled train nodes: ~9500, Label distribution: [~8550  ~950]  # ~9.5% fraud
+# Labeled test nodes: ~2375, Label distribution: [~2137  ~238]
+# ...
+# Training on 9555 nodes, Labeled nodes: ~9500, Label distribution: [~8550  ~950]
+# Epoch 1, Loss: 0.6931, Train Accuracy (Labeled): 0.9050
+# ...
+# Epoch 50, Loss: 0.4000, Train Accuracy (Labeled): 0.9200
+#
+# Evaluation Metrics (on labeled test nodes):
+# Accuracy: 0.9100
+# Precision: 0.6500
+# Recall: 0.5500
+# F1-Score (Micro): 0.9100
+# F1-Score (Macro): 0.7500
+# AUC: 0.8200
+#
+# Confusion Matrix:
+# [[2100   37]
+#  [ 107  131]]
+#
+# Classification Report:
+#               precision    recall  f1-score   support
+#    Non-Fraud       0.95      0.98      0.97      2137
+#        Fraud       0.65      0.55      0.60       238
+#     accuracy                           0.91      2375
+#    macro avg       0.80      0.77      0.78      2375
+# weighted avg       0.90      0.91      0.91      2375

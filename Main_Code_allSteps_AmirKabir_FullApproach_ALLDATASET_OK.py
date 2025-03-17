@@ -1,0 +1,709 @@
+# -*- coding: utf-8 -*-
+import dgl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
+from torch_geometric.data import Data
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (f1_score, roc_auc_score, confusion_matrix,
+                             precision_score, recall_score, classification_report)
+import random
+import networkx as nx
+import pandas as pd
+from gensim.models import Word2Vec
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.sparse import csr_matrix
+from datetime import timedelta
+from hmmlearn import hmm
+
+# Constants
+EMBEDDING_SIZE = 16
+HIDDEN_SIZE = 16
+NUM_TEMPORAL_BASES = 4
+NUM_RELATIONS = 1  # Single relation type (Primary_ID -> Second_ID)
+
+# Step 1: HMM-based Embeddings
+def compute_hmm_based_embeddings(graph, primary_to_idx, second_to_idx, transactions_path="Transactions.csv"):
+    print("Step 1: Computing HMM-based embeddings...")
+    # Load transactions with timestamps
+    df = pd.read_csv(transactions_path)
+    df['Date'] = pd.to_datetime(df['Date'])  # Ensure Date is in datetime format
+
+    # Sort by date to determine time windows
+    df_sorted = df.sort_values('Date')
+    start_date = df_sorted['Date'].min()
+    end_date = df_sorted['Date'].max()
+    window_size = timedelta(days=5)
+
+    # Initialize list to store graphs for each 5-day window
+    graphs = []
+    time_windows = []
+    current_start = start_date
+
+    # Create 5-day window graphs
+    while current_start < end_date:
+        current_end = current_start + window_size
+        window_df = df_sorted[(df_sorted['Date'] >= current_start) & (df_sorted['Date'] < current_end)]
+        if not window_df.empty:
+            G_nx = nx.DiGraph()
+            edge_list = window_df[['Primary_ID', 'Second_ID']].values
+            G_nx.add_edges_from(edge_list)
+            graphs.append(G_nx)
+            time_windows.append((current_start, current_end))
+        current_start = current_end
+
+    print(f"Created {len(graphs)} 5-day graphs.")
+
+    # Compute centrality features for each graph
+    num_nodes = graph.num_nodes()  # Use total nodes from the full graph for consistency
+
+    # Define centrality features to compute
+    centrality_measures = [
+        nx.degree_centrality,
+        nx.in_degree_centrality,
+        nx.out_degree_centrality,
+        nx.closeness_centrality,
+        nx.betweenness_centrality,
+        nx.eigenvector_centrality,
+        nx.pagerank,
+        nx.harmonic_centrality
+    ]
+    num_features = len(centrality_measures)  # 8 features
+
+    # Initialize feature matrix: [num_nodes, num_features, num_windows]
+    feature_matrix = np.zeros((num_nodes, num_features, len(graphs)))
+
+    for t, G in enumerate(graphs):
+        print(f"Computing centralities for window {t + 1}/{len(graphs)}...")
+        for f_idx, centrality_fn in enumerate(centrality_measures):
+            if centrality_fn == nx.betweenness_centrality:
+                centrality = centrality_fn(G, k=min(1000, G.number_of_nodes()))
+            elif centrality_fn == nx.eigenvector_centrality:
+                centrality = centrality_fn(G, tol=1e-05)
+            elif centrality_fn == nx.pagerank:
+                centrality = centrality_fn(G, tol=1e-06)
+            else:
+                centrality = centrality_fn(G)
+
+            for node in centrality:
+                if node in primary_to_idx:
+                    idx = primary_to_idx[node]
+                elif node in second_to_idx:
+                    idx = second_to_idx[node]
+                else:
+                    continue  # Skip if node not in full graph
+                if idx >= num_nodes:  # Ensure index is within bounds
+                    continue
+                feature_matrix[idx, f_idx, t] = centrality[node]
+
+    # Train HMM for each feature and compute scores
+    hmm_embeddings = {}
+    for node_idx in range(num_nodes):
+        node_features = feature_matrix[node_idx]  # Shape: [num_features, num_windows]
+        hmm_scores = []
+        for f_idx in range(num_features):
+            sequence = node_features[f_idx].reshape(-1, 1)  # Shape: [num_windows, 1]
+            if np.all(sequence == 0):  # Skip if all zeros (node not present)
+                hmm_scores.append(0.0)
+                continue
+
+            # Train HMM (Gaussian HMM with 2 components)
+            model = hmm.GaussianHMM(n_components=2, covariance_type="diag", n_iter=100)
+            try:
+                model.fit(sequence)
+                score = model.score(sequence)  # Log-likelihood score
+                hmm_scores.append(score)
+            except:
+                hmm_scores.append(0.0)  # Default score if HMM fails
+
+        hmm_embeddings[node_idx] = hmm_scores  # 8D vector of HMM scores
+
+    print(f"HMM-based embeddings computed for {len(hmm_embeddings)} nodes.")
+    return hmm_embeddings
+
+# Step 2: Probabilistic FraudWalk Embeddings (Updated)
+def compute_probabilistic_fraudwalk_embeddings(graph, transactions_path="Transactions.csv", train_mask=None,
+                                               inductive_nodes=None):
+    print("Step 2: Computing Probabilistic FraudWalk embeddings...")
+    # Load transactions with timestamps
+    df = pd.read_csv(transactions_path)
+    df['Date'] = pd.to_datetime(df['Date'])
+
+    # Create sequences
+    lst_all_sequences = []
+    dic = {}
+    dic_timestamp = {}
+
+    # Source Sequences (Second_ID -> Primary_ID)
+    df_sorted_source = df.sort_values(['Second_ID', 'Date'], ascending=[True, True])
+    df_grouped_source = df_sorted_source.groupby('Second_ID').agg({'Primary_ID': list, 'Amount': list, 'Date': list}).reset_index()
+    for _, row in df_grouped_source.iterrows():
+        sources = row['Primary_ID']
+        amounts = row['Amount']
+        dates = row['Date']
+        if len(sources) > 1:
+            lst_all_sequences.append(sources)
+            for i in range(len(sources) - 1):
+                src, tgt = sources[i], sources[i + 1]
+                if src not in dic:
+                    dic[src] = {}
+                    dic_timestamp[src] = {}
+                dic[src][tgt] = amounts[i] + amounts[i + 1]
+                dic_timestamp[src][tgt] = max(dates[i], dates[i + 1])
+
+    # Target Sequences (Primary_ID -> Second_ID)
+    df_sorted_target = df.sort_values(['Primary_ID', 'Date'], ascending=[True, True])
+    df_grouped_target = df_sorted_target.groupby('Primary_ID').agg({'Second_ID': list, 'Amount': list, 'Date': list}).reset_index()
+    for _, row in df_grouped_target.iterrows():
+        targets = row['Second_ID']
+        amounts = row['Amount']
+        dates = row['Date']
+        if len(targets) > 1:
+            lst_all_sequences.append(targets)
+            for i in range(len(targets) - 1):
+                src, tgt = targets[i], targets[i + 1]
+                if src not in dic:
+                    dic[src] = {}
+                    dic_timestamp[src] = {}
+                dic[src][tgt] = amounts[i] + amounts[i + 1]
+                dic_timestamp[src][tgt] = max(dates[i], dates[i + 1])
+
+    # Construct Graph G from All Sequences
+    G = nx.DiGraph()
+    for sequence in lst_all_sequences:
+        for node in sequence:
+            G.add_node(node)
+    for sequence in lst_all_sequences:
+        for i in range(len(sequence) - 1):
+            source = sequence[i]
+            target = sequence[i + 1]
+            try:
+                if G.has_edge(source, target):
+                    G[source][target]['weight'] += dic[source][target]
+                else:
+                    G.add_edge(source, target, weight=dic[source][target], datetime=dic_timestamp[source][target])
+            except KeyError:
+                continue  # Skip if no weight/timestamp available
+
+    # Probabilistic constrained random walk
+    def get_valid_neighbors(graph, current_node, delta_t, t_vu):
+        valid_neighbors = []
+        for neighbor in graph.neighbors(current_node):
+            if 'datetime' not in graph[current_node][neighbor]:
+                continue
+            interaction_time = graph[current_node][neighbor]['datetime']
+            if t_vu == 0:  # First time
+                valid_neighbors.append(neighbor)
+            else:
+                lower_bound = t_vu - timedelta(days=delta_t)
+                upper_bound = t_vu + timedelta(days=delta_t)
+                if lower_bound <= interaction_time <= upper_bound:
+                    valid_neighbors.append(neighbor)
+        return valid_neighbors
+
+    def select_best_neighbor(graph, source_node, neighbors):
+        common_counts = [(n, len(set(graph.successors(source_node)).intersection(graph.predecessors(n)))) for n in neighbors]
+        if not common_counts:
+            return random.choice(neighbors) if neighbors else None
+        return max(common_counts, key=lambda x: x[1])[0]
+
+    def probabilistic_constrained_random_walk(graph, start_node, delta_t, walk_length):
+        walk = [start_node]
+        t_vu = 0
+        for _ in range(walk_length - 1):
+            current_node = walk[-1]
+            valid_neighbors = get_valid_neighbors(graph, current_node, delta_t, t_vu)
+            if not valid_neighbors:
+                break
+            next_node = select_best_neighbor(graph, current_node, valid_neighbors)
+            if not next_node:
+                break
+            walk.append(next_node)
+            t_vu = graph[current_node][next_node]['datetime']
+        return [str(n) for n in walk]  # Convert to strings for Word2Vec
+
+    # Generate walks
+    delta_t = 10  # 10-day window
+    num_walks = 1000
+    walk_length = 50
+    nodes = list(G.nodes())
+    if train_mask is not None:
+        train_nodes = [n for n in nodes if n in train_mask]
+    else:
+        train_nodes = nodes
+
+    walks = []
+    for _ in range(num_walks):
+        start_node = random.choice(train_nodes)
+        walk = probabilistic_constrained_random_walk(G, start_node, delta_t, walk_length)
+        if len(walk) > 1:
+            walks.append(walk)
+
+    # Train Word2Vec
+    model = Word2Vec(sentences=walks, vector_size=5, window=5, sg=1, min_count=1, workers=4)
+    base_embeddings = {int(node): model.wv[node] for node in model.wv.index_to_key if node.isdigit()}
+
+    # Map to all graph nodes
+    unique_primary_ids = df['Primary_ID'].unique()
+    unique_second_ids = df['Second_ID'].unique()
+    primary_to_idx = {pid: i for i, pid in enumerate(unique_primary_ids)}
+    second_to_idx = {sid: i + len(unique_primary_ids) for i, sid in enumerate(unique_second_ids)}
+
+    fraudwalk_embeddings = {}
+    for node_idx in range(graph.num_nodes()):
+        node_id = None
+        for pid, idx in primary_to_idx.items():
+            if idx == node_idx:
+                node_id = pid
+                break
+        if node_id is None:
+            for sid, idx in second_to_idx.items():
+                if idx == node_idx:
+                    node_id = sid
+                    break
+        if node_id not in G:
+            fraudwalk_embeddings[node_idx] = np.zeros(5)
+        elif str(node_id) not in base_embeddings:
+            neighbors = list(G.neighbors(node_id))
+            if not neighbors:
+                fraudwalk_embeddings[node_idx] = np.zeros(5)
+            else:
+                neighbor_embs = [base_embeddings.get(str(n), np.zeros(5)) for n in neighbors]
+                fraudwalk_embeddings[node_idx] = np.mean(neighbor_embs, axis=0) if neighbor_embs else np.zeros(5)
+        else:
+            fraudwalk_embeddings[node_idx] = base_embeddings[str(node_id)]
+
+    print(f"Probabilistic FraudWalk embeddings generated for {len(fraudwalk_embeddings)} nodes.")
+    return fraudwalk_embeddings
+
+# Step 3: Reconstruct Adjacency and GCN
+def reconstruct_adj_and_gcn(graph, labels, train_mask):
+    print("Step 3: Reconstructing adjacency matrix with GAE and GCN (optimized)...")
+    G_nx = nx.DiGraph()
+    src, tgt = graph.edges()
+    edge_list = list(zip(src.numpy(), tgt.numpy()))
+    G_nx.add_edges_from(edge_list)
+    valid_nodes = set(G_nx.nodes())
+    node_list = list(G_nx.nodes())
+    node_to_idx = {node: idx for idx, node in enumerate(node_list)}
+
+    all_labeled_idx = torch.where(labels != -1)[0].tolist()
+    fraud_nodes = [idx for idx in all_labeled_idx if labels[idx] == 1 and idx in valid_nodes][:50]
+    if not fraud_nodes:
+        print("Warning: No fraud nodes found in reduced graph. Using first 50 valid labeled nodes.")
+        fraud_nodes = [idx for idx in all_labeled_idx if idx in valid_nodes][:50]
+    num_fraud_nodes = len(fraud_nodes)
+    print(f"Processing {num_fraud_nodes} fraud nodes.")
+
+    adj_matrix_sparse = nx.adjacency_matrix(G_nx)
+    fraud_indices = np.array([node_to_idx[node] for node in fraud_nodes if node in node_to_idx])
+    if len(fraud_indices) == 0:
+        print("Error: No valid fraud indices after mapping. Using first 50 indices.")
+        fraud_indices = np.arange(min(50, adj_matrix_sparse.shape[0]))
+    sub_adj_matrix = adj_matrix_sparse[fraud_indices, :][:, fraud_indices].tocsr()
+
+    class GraphAutoencoder(nn.Module):
+        def __init__(self, input_dim, hidden_dim, latent_dim):
+            super().__init__()
+            self.encoder = nn.Sequential(nn.Linear(input_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, latent_dim))
+            self.decoder = nn.Sequential(nn.Linear(latent_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, input_dim))
+
+        def forward(self, x):
+            latent = self.encoder(x)
+            return self.decoder(latent), latent
+
+    features = torch.eye(num_fraud_nodes, dtype=torch.float)
+    integrated_features = torch.sparse.mm(torch.from_numpy(sub_adj_matrix.toarray()).float(), features)
+    gae = GraphAutoencoder(input_dim=num_fraud_nodes, hidden_dim=10, latent_dim=5)
+    optimizer = torch.optim.Adam(gae.parameters(), lr=0.01)
+    criterion = nn.MSELoss()
+    for epoch in range(20):
+        optimizer.zero_grad()
+        reconstructed, latent = gae(integrated_features)
+        loss = criterion(reconstructed, integrated_features)
+        loss.backward()
+        optimizer.step()
+        if epoch % 10 == 0:
+            print(f"GAE Epoch {epoch}, Loss: {loss.item():.4f}")
+
+    latent_reps = latent.detach().numpy()
+    pairwise_similarity = cosine_similarity(latent_reps)
+    row_indices, col_indices = np.where(pairwise_similarity > 0.7)
+    values = pairwise_similarity[row_indices, col_indices]
+    reconstructed_sub_adj = csr_matrix((values, (row_indices, col_indices)), shape=(num_fraud_nodes, num_fraud_nodes))
+    full_shape = (graph.num_nodes(), graph.num_nodes())
+    full_row_indices = np.array(fraud_nodes)[row_indices]
+    full_col_indices = np.array(fraud_nodes)[col_indices]
+    reconstructed_adj = csr_matrix((values, (full_row_indices, full_col_indices)), shape=full_shape)
+    reconstructed_adj_coo = reconstructed_adj.tocoo()
+    indices = torch.tensor([reconstructed_adj_coo.row, reconstructed_adj_coo.col], dtype=torch.long)
+    values = torch.tensor(reconstructed_adj_coo.data, dtype=torch.float)
+    reconstructed_adj_torch = torch.sparse_coo_tensor(indices, values, full_shape).coalesce()
+
+    edge_index = torch.stack(graph.edges(), dim=0)
+    data_gcn = Data(x=torch.zeros(graph.num_nodes(), 8, dtype=torch.float), edge_index=edge_index)
+
+    class GCN(nn.Module):
+        def __init__(self, input_dim, hidden_dim, output_dim):
+            super().__init__()
+            self.conv1 = GCNConv(input_dim, hidden_dim)
+            self.conv2 = GCNConv(hidden_dim, output_dim)
+
+        def forward(self, data):
+            x = F.relu(self.conv1(data.x, data.edge_index))
+            return self.conv2(x, data.edge_index)
+
+    gcn = GCN(input_dim=8, hidden_dim=16, output_dim=10)
+    optimizer = torch.optim.Adam(gcn.parameters(), lr=0.01)
+    for epoch in range(3):
+        optimizer.zero_grad()
+        embeddings = gcn(data_gcn)
+        loss = torch.mean(embeddings)
+        loss.backward()
+        optimizer.step()
+        if epoch % 1 == 0:
+            print(f"GCN Epoch {epoch}, Loss: {loss.item():.4f}")
+
+    gcn_embeddings = embeddings.detach().numpy()
+    print(f"GCN embeddings generated for {len(gcn_embeddings)} nodes.")
+    return gcn_embeddings, reconstructed_adj_torch
+
+# DataLoader for Custom Dataset
+class DataLoader:
+    @staticmethod
+    def load_custom_data(transactions_path="Transactions.csv", labels_path="Second_ID_Label.csv"):
+        print("Loading custom dataset...")
+        df = pd.read_csv(transactions_path)
+        df_labels = pd.read_csv(labels_path)
+
+        data = {
+            'Primary_ID': list(df['Primary_ID'].values),
+            'Second_ID': list(df['Second_ID'].values),
+        }
+        df_graph = pd.DataFrame(data)
+        df_graph_clean = df_graph.dropna(subset=['Primary_ID', 'Second_ID'])
+        df_graph_unique = df_graph_clean.drop_duplicates(subset=['Primary_ID', 'Second_ID'])
+
+        unique_primary_ids = df_graph_unique['Primary_ID'].unique()
+        unique_second_ids = df_graph_unique['Second_ID'].unique()
+        primary_to_idx = {pid: i for i, pid in enumerate(unique_primary_ids)}
+        second_to_idx = {sid: i + len(unique_primary_ids) for i, sid in enumerate(unique_second_ids)}
+        num_nodes = len(unique_primary_ids) + len(unique_second_ids)
+
+        src = df_graph_unique['Primary_ID'].map(primary_to_idx).values
+        tgt = df_graph_unique['Second_ID'].map(second_to_idx).values
+        edge_index = torch.tensor([src, tgt], dtype=torch.long)
+
+        graph = dgl.graph((edge_index[0], edge_index[1]), num_nodes=num_nodes)
+        features = torch.zeros((num_nodes, 1), dtype=torch.float)
+
+        label_dict = dict(zip(df_labels['Second_ID'], df_labels['Label']))
+        labels = torch.full((num_nodes,), -1, dtype=torch.long)
+        for sid, idx in second_to_idx.items():
+            if sid in label_dict:
+                labels[idx] = label_dict[sid]
+
+        graph.ndata['feature'] = features
+        graph.ndata['label'] = labels
+        num_classes = 2
+
+        print(f"Dataset loaded: {graph.num_nodes()} nodes, {graph.num_edges()} edges, "
+              f"{features.shape[1]} features, {num_classes} classes")
+        return graph, features, labels, num_classes, primary_to_idx, second_to_idx
+
+# GraphProcessor
+class GraphProcessor:
+    @staticmethod
+    def convert_to_pyg_format(graph, features):
+        print("Converting DGL graph to PyTorch Geometric format...")
+        edge_index = torch.stack(graph.edges(), dim=0)
+        print(f"Using all edges: {edge_index.shape[1]} edges selected")
+        data = Data(x=features, edge_index=edge_index)
+        print(f"PyG Data created: {data.num_nodes} nodes, {data.num_edges} edges")
+        return data
+
+    @staticmethod
+    def prepare_masks(labels, train_ratio=0.8):
+        print("Preparing train/test masks using all data...")
+        all_nodes = list(range(len(labels)))
+        train_mask, test_mask = train_test_split(all_nodes, train_size=train_ratio, random_state=42)
+
+        labeled_idx = torch.where(labels != -1)[0].tolist()
+        train_labeled = [i for i in train_mask if i in labeled_idx]
+        test_labeled = [i for i in test_mask if i in labeled_idx]
+
+        train_labels = [labels[i].item() for i in train_labeled]
+        test_labels = [labels[i].item() for i in test_labeled]
+        print(f"Total nodes: {len(all_nodes)}, Train mask: {len(train_mask)} nodes, Test mask: {len(test_mask)} nodes")
+        print(f"Labeled train nodes: {len(train_labeled)}, Label distribution: {np.bincount(train_labels)}")
+        print(f"Labeled test nodes: {len(test_labeled)}, Label distribution: {np.bincount(test_labels)}")
+        return train_mask, test_mask, train_labeled, test_labeled
+
+# Model Classes
+class TemporalDependencyModel(nn.Module):
+    def __init__(self, embedding_size, hidden_size, num_temporal_bases):
+        super().__init__()
+        self.attribute_embedding = nn.Linear(embedding_size, hidden_size)
+        self.temporal_encoding = TemporalEncoding(hidden_size, num_temporal_bases)
+
+    def forward(self, x, timestamp):
+        attr_emb = F.relu(self.attribute_embedding(x))
+        temp_enc = self.temporal_encoding(timestamp)
+        return attr_emb + temp_enc
+
+class TemporalEncoding(nn.Module):
+    def __init__(self, embedding_size, num_temporal_bases):
+        super().__init__()
+        self.num_temporal_bases = num_temporal_bases
+        self.linear = nn.Linear(num_temporal_bases * 2, embedding_size)
+
+    def forward(self, tvi):
+        bases = torch.zeros(self.num_temporal_bases, 2)
+        for i in range(self.num_temporal_bases):
+            bases[i, 0] = torch.sin(tvi / (10000.0 ** (2 * i / self.num_temporal_bases)))
+            bases[i, 1] = torch.cos(tvi / (10000.0 ** (2 * i + 1 / self.num_temporal_bases)))
+        return F.relu(self.linear(bases.view(1, -1)))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, input_size, num_heads, adj_matrix):
+        super().__init__()
+        self.input_size = input_size
+        self.num_heads = num_heads
+        self.head_dim = input_size // num_heads
+        assert input_size % num_heads == 0, "input_size must be divisible by num_heads"
+        self.qkv_proj = nn.Linear(input_size, input_size * 3)
+        if torch.is_tensor(adj_matrix) and adj_matrix.is_sparse:
+            indices = adj_matrix.indices()
+            self.src = indices[0]
+            self.tgt = indices[1]
+        else:
+            self.src, self.tgt = adj_matrix.nonzero(as_tuple=True)
+        self.ffn = nn.Sequential(nn.Linear(input_size, 4 * input_size), nn.ReLU(),
+                                 nn.Linear(4 * input_size, input_size))
+        self.norm1 = nn.LayerNorm(input_size)
+        self.norm2 = nn.LayerNorm(input_size)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x, node_indices):
+        batch_size, num_nodes, _ = x.size()
+        if batch_size != 1:
+            raise ValueError("Sparse attention assumes batch_size=1")
+        index_map = {idx.item(): i for i, idx in enumerate(node_indices)}
+        mask = torch.tensor(
+            [idx.item() in index_map and self.tgt[i].item() in index_map for i, idx in enumerate(self.src)],
+            dtype=torch.bool)
+        src_sub, tgt_sub = self.src[mask], self.tgt[mask]
+        src_mapped = torch.tensor([index_map[idx.item()] for idx in src_sub], dtype=torch.long)
+        tgt_mapped = torch.tensor([index_map[idx.item()] for idx in tgt_sub], dtype=torch.long)
+        qkv = self.qkv_proj(x).reshape(num_nodes, 3 * self.input_size)
+        q, k, v = qkv.split(self.input_size, dim=-1)
+        q = q.view(num_nodes, self.num_heads, self.head_dim)
+        k = k.view(num_nodes, self.num_heads, self.head_dim)
+        v = v.view(num_nodes, self.num_heads, self.head_dim)
+        if src_mapped.size(0) == 0:
+            x = self.norm1(x.squeeze(0))
+            ffn_out = self.ffn(x)
+            return self.norm2(x + ffn_out).unsqueeze(0)
+        q_edges, k_edges = q[src_mapped], k[tgt_mapped]
+        attn_scores = (q_edges * k_edges).sum(dim=-1) / (self.head_dim ** 0.5)
+        attn_weights = torch.zeros_like(attn_scores)
+        for head in range(self.num_heads):
+            scores_head = attn_scores[:, head]
+            weights_head = torch.zeros(num_nodes, device=x.device)
+            weights_head.index_add_(0, src_mapped, F.softmax(scores_head, dim=0))
+            attn_weights[:, head] = weights_head[src_mapped]
+        v_edges = v[tgt_mapped]
+        out = torch.zeros(num_nodes, self.num_heads, self.head_dim, device=x.device)
+        for head in range(self.num_heads):
+            weighted_v = attn_weights[:, head].unsqueeze(-1) * v_edges[:, head, :]
+            out[:, head, :].index_add_(0, src_mapped, weighted_v)
+        out = out.view(num_nodes, self.input_size)
+        out = self.dropout(out)
+        x = self.norm1(x.squeeze(0) + out)
+        ffn_out = self.ffn(x)
+        return self.norm2(x + ffn_out).unsqueeze(0)
+
+class MLP(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, 1)
+        self.dropout = nn.Dropout(0.3)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        return self.fc2(x)
+
+class SpatialDependencyModel(nn.Module):
+    def __init__(self, num_relations, hidden_size, mlp_hidden_size, adj_matrix):
+        super().__init__()
+        self.transformer = TransformerBlock(hidden_size, num_heads=4, adj_matrix=adj_matrix)
+        self.mlp = MLP(hidden_size, mlp_hidden_size)
+        self.adj_matrix = adj_matrix
+        self.neighbors = {}
+        if torch.is_tensor(adj_matrix) and adj_matrix.is_sparse:
+            indices = adj_matrix.indices()
+            values = adj_matrix.values()
+            for i in range(indices.size(1)):
+                src = indices[0, i].item()
+                tgt = indices[1, i].item()
+                weight = values[i].item()
+                if src not in self.neighbors:
+                    self.neighbors[src] = []
+                self.neighbors[src].append((tgt, weight))
+
+    def forward(self, node_embeddings, timestamp, relations, index_obtains):
+        aggregated_reps = []
+        valid_indices = []
+        for vi in index_obtains:
+            neighbor_list = self.neighbors.get(vi, [])
+            if not neighbor_list:
+                aggregated_reps.append(node_embeddings[vi])
+                valid_indices.append(vi)
+                continue
+            neighbors, weights = zip(*neighbor_list)
+            neighbors = torch.tensor(neighbors, dtype=torch.long)
+            weights = torch.tensor(weights, dtype=torch.float)
+            neighbor_emb = node_embeddings[neighbors]
+            weights = weights.view(-1, 1)
+            intra_agg = torch.mean(weights * neighbor_emb, dim=0)
+            diff = node_embeddings[vi] - neighbor_emb
+            inter_agg = torch.mean(diff, dim=0)
+            combined = intra_agg + inter_agg
+            if combined.dim() > 0:
+                aggregated_reps.append(combined)
+                valid_indices.append(vi)
+
+        fused = torch.stack(aggregated_reps)
+        fused = fused.unsqueeze(0)
+        fused = self.transformer(fused, torch.tensor(valid_indices, dtype=torch.long))
+        fused = fused.squeeze(0)
+        prediction = self.mlp(fused)
+        return prediction, fused, None, valid_indices
+
+class TemporalSpatialModel(nn.Module):
+    def __init__(self, embedding_size, hidden_size, num_temporal_bases, num_relations, mlp_hidden_size, adj_matrix):
+        super().__init__()
+        self.temporal = TemporalDependencyModel(embedding_size, hidden_size, num_temporal_bases)
+        self.spatial = SpatialDependencyModel(num_relations, hidden_size, mlp_hidden_size, adj_matrix)
+
+    def forward(self, x, node_indices, timestamp, relations, index_obtains):
+        temporal_emb = self.temporal(x, timestamp)
+        return self.spatial(temporal_emb, timestamp, relations, index_obtains)
+
+class CombinedModel(nn.Module):
+    def __init__(self, input_dim, embedding_size, hidden_size, num_temporal_bases, num_relations, mlp_hidden_size,
+                 adj_matrix):
+        super().__init__()
+        self.initial_conv = GCNConv(input_dim, embedding_size)
+        self.temporal_spatial = TemporalSpatialModel(embedding_size, hidden_size, num_temporal_bases, num_relations,
+                                                     mlp_hidden_size, adj_matrix)
+
+    def forward(self, data, node_indices, timestamp, relations, index_obtains):
+        x = F.relu(self.initial_conv(data.x, data.edge_index))
+        return self.temporal_spatial(x, node_indices, timestamp, relations, index_obtains)
+
+# Training Function
+def train_model(model, data, labels, train_mask, test_mask, train_labeled, test_labeled, num_epochs=50):
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    loss_fn = nn.BCEWithLogitsLoss()
+    train_subset = train_mask
+    test_subset = test_mask
+    train_labels = torch.tensor([labels[i] for i in train_labeled], dtype=torch.float)
+    print(f"Training on {len(train_subset)} nodes, Labeled nodes: {len(train_labeled)}, "
+          f"Label distribution: {np.bincount(train_labels.int())}")
+
+    model.train()
+    for epoch in range(num_epochs):
+        optimizer.zero_grad()
+        pred, _, _, idx = model(data, torch.tensor(train_subset), torch.tensor(123.45), [1], train_subset)
+        if pred is None:
+            print(f"Epoch {epoch + 1}: No predictions generated")
+            continue
+        labeled_mask = torch.tensor([i in train_labeled for i in train_subset], dtype=torch.bool)
+        pred_labeled = pred[labeled_mask]
+        loss = loss_fn(pred_labeled.squeeze(), train_labels)
+        loss.backward()
+        optimizer.step()
+        accuracy = ((pred_labeled.squeeze() > 0).float() == train_labels).float().mean().item()
+        print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}, Train Accuracy (Labeled): {accuracy:.4f}")
+
+    model.eval()
+    with torch.no_grad():
+        pred, _, _, idx = model(data, torch.tensor(test_subset), torch.tensor(123.45), [1], test_subset)
+        if pred is None:
+            print("No predictions generated during evaluation")
+            return
+        test_labels = torch.tensor([labels[i] for i in test_labeled], dtype=torch.float)
+        labeled_mask = torch.tensor([i in test_labeled for i in test_subset], dtype=torch.bool)
+        pred_labeled = pred[labeled_mask]
+        pred_binary = (pred_labeled.squeeze() > 0).float()
+        test_labels_np = test_labels.numpy()
+        pred_binary_np = pred_binary.numpy()
+
+        accuracy = (pred_binary == test_labels).float().mean().item()
+        precision = precision_score(test_labels_np, pred_binary_np)
+        recall = recall_score(test_labels_np, pred_binary_np)
+        f1_micro = f1_score(test_labels_np, pred_binary_np, average='micro')
+        f1_macro = f1_score(test_labels_np, pred_binary_np, average='macro')
+        unique_classes = np.unique(test_labels_np)
+        auc = roc_auc_score(test_labels_np, torch.sigmoid(pred_labeled.squeeze()).numpy()) if len(
+            unique_classes) > 1 else None
+        cm = confusion_matrix(test_labels_np, pred_binary_np)
+
+        print("\nEvaluation Metrics (on labeled test nodes):")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1-Score (Micro): {f1_micro:.4f}")
+        print(f"F1-Score (Macro): {f1_macro:.4f}")
+        print(f"AUC: {auc:.4f}" if auc is not None else "AUC: Not defined (only one class present)")
+        print("\nConfusion Matrix:")
+        print(cm)
+        print("\nClassification Report:")
+        print(classification_report(test_labels_np, pred_binary_np, target_names=['Non-Fraud', 'Fraud']))
+
+# Main Function
+def main():
+    graph, features, labels, num_classes, primary_to_idx, second_to_idx = DataLoader.load_custom_data(
+        transactions_path="Transactions.csv",
+        labels_path="Second_ID_Label.csv"
+    )
+    hmm_embeddings = compute_hmm_based_embeddings(graph, primary_to_idx, second_to_idx,
+                                                  transactions_path="Transactions.csv")
+    train_mask, test_mask, train_labeled, test_labeled = GraphProcessor.prepare_masks(labels)
+
+    fraudwalk_embeddings = compute_probabilistic_fraudwalk_embeddings(
+        graph, transactions_path="Transactions.csv", train_mask=train_mask, inductive_nodes=test_mask
+    )
+    gcn_embeddings, reconstructed_adj = reconstruct_adj_and_gcn(graph, labels, train_mask)
+
+    print("Step 4: Combining embeddings...")
+    num_nodes = graph.num_nodes()
+    combined_embeddings = np.zeros((num_nodes, 23))  # 8D HMM + dern5D FraudWalk + 10D GCN
+    for i in range(num_nodes):
+        hmm = hmm_embeddings.get(i, [0] * 8)
+        fraudwalk = fraudwalk_embeddings.get(i, np.zeros(5))
+        gcn = gcn_embeddings[i] if i < len(gcn_embeddings) else np.zeros(10)
+        combined_embeddings[i] = np.concatenate([hmm, fraudwalk, gcn])
+
+    data = GraphProcessor.convert_to_pyg_format(graph, torch.from_numpy(combined_embeddings).float())
+    adj_matrix = reconstructed_adj
+    print(f"Using reconstructed adjacency matrix: {adj_matrix.shape}, {adj_matrix._nnz()} edges")
+
+    model = CombinedModel(
+        input_dim=23,
+        embedding_size=EMBEDDING_SIZE,
+        hidden_size=HIDDEN_SIZE,
+        num_temporal_bases=NUM_TEMPORAL_BASES,
+        num_relations=NUM_RELATIONS,
+        mlp_hidden_size=EMBEDDING_SIZE,
+        adj_matrix=adj_matrix
+    )
+    train_model(model, data, labels, train_mask, test_mask, train_labeled, test_labeled)
+
+if __name__ == "__main__":
+    main()
